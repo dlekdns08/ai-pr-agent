@@ -1,4 +1,4 @@
-"""GitHub PR에 리뷰 결과를 코멘트로 작성한다."""
+"""GitHub PR 또는 커밋에 리뷰 결과를 코멘트로 작성한다."""
 
 import os
 
@@ -58,7 +58,7 @@ def _build_summary(issues: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def post_review(
+async def post_pr_review(
     owner: str, repo: str, pr_number: str, commit_sha: str, issues: list[dict]
 ) -> None:
     """PR에 Review API로 인라인 코멘트 + 요약을 한 번에 제출한다."""
@@ -89,7 +89,33 @@ async def post_review(
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, headers=_headers(), json=payload)
-        # 인라인 코멘트 라인 매핑 실패 시 코멘트 없이 요약만 재시도
         if resp.status_code >= 400 and comments:
             payload["comments"] = []
             await client.post(url, headers=_headers(), json=payload)
+
+
+async def post_commit_comment(
+    owner: str, repo: str, commit_sha: str, issues: list[dict]
+) -> None:
+    """커밋에 인라인 코멘트 + 요약을 작성한다."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        # 1) 인라인 코멘트 (파일의 특정 라인에)
+        for issue in issues:
+            line = issue.get("line")
+            filename = issue.get("filename")
+            if line and filename:
+                url = f"{GITHUB_API}/repos/{owner}/{repo}/commits/{commit_sha}/comments"
+                payload = {
+                    "body": _format_comment(issue),
+                    "path": filename,
+                    "line": line,
+                }
+                resp = await client.post(url, headers=_headers(), json=payload)
+                # 라인 매핑 실패 시 무시
+                if resp.status_code >= 400:
+                    continue
+
+        # 2) 전체 요약 코멘트
+        summary = _build_summary(issues)
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/commits/{commit_sha}/comments"
+        await client.post(url, headers=_headers(), json={"body": summary})
