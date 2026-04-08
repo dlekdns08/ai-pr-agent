@@ -1,0 +1,9 @@
+[project]
+name = "ai-pr-agent"
+version = "0.1.0"
+description = "AI-powered MR code review agent for GitLab CI"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.92.0",
+    "httpx>=0.28.1",
+]
