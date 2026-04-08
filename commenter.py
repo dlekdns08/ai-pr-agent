@@ -1,11 +1,11 @@
-"""GitLab MR에 리뷰 결과를 코멘트로 작성한다."""
+"""GitHub PR에 리뷰 결과를 코멘트로 작성한다."""
 
 import os
 
 import httpx
 
-GITLAB_URL = os.environ.get("CI_SERVER_URL", "https://gitlab.com")
-PRIVATE_TOKEN = os.environ.get("GITLAB_TOKEN", "")
+GITHUB_API = "https://api.github.com"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 SEVERITY_EMOJI = {
     "critical": "\u2757",  # ❗
@@ -16,7 +16,10 @@ SEVERITY_EMOJI = {
 
 
 def _headers() -> dict:
-    return {"PRIVATE-TOKEN": PRIVATE_TOKEN}
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
 
 
 def _format_comment(issue: dict) -> str:
@@ -55,61 +58,38 @@ def _build_summary(issues: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def post_mr_note(project_id: str, mr_iid: str, body: str) -> None:
-    """MR에 일반 노트(코멘트)를 작성한다."""
-    url = f"{GITLAB_URL}/api/v4/projects/{project_id}/merge_requests/{mr_iid}/notes"
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, headers=_headers(), json={"body": body})
-        resp.raise_for_status()
-
-
-async def post_inline_comment(
-    project_id: str,
-    mr_iid: str,
-    filename: str,
-    line: int,
-    body: str,
-    sha: str,
-) -> None:
-    """MR diff의 특정 라인에 인라인 코멘트를 작성한다."""
-    url = (
-        f"{GITLAB_URL}/api/v4/projects/{project_id}"
-        f"/merge_requests/{mr_iid}/discussions"
-    )
-    payload = {
-        "body": body,
-        "position": {
-            "base_sha": sha,
-            "head_sha": sha,
-            "start_sha": sha,
-            "position_type": "text",
-            "new_path": filename,
-            "new_line": line,
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, headers=_headers(), json=payload)
-        # 인라인 코멘트 실패 시 무시 (라인 매핑이 안 되는 경우)
-        if resp.status_code >= 400:
-            return
-
-
 async def post_review(
-    project_id: str, mr_iid: str, issues: list[dict], sha: str
+    owner: str, repo: str, pr_number: str, commit_sha: str, issues: list[dict]
 ) -> None:
-    """리뷰 결과를 MR에 게시한다 (요약 + 인라인 코멘트)."""
-    # 1) 인라인 코멘트
+    """PR에 Review API로 인라인 코멘트 + 요약을 한 번에 제출한다."""
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+
+    comments = []
     for issue in issues:
         line = issue.get("line")
         filename = issue.get("filename")
         if line and filename:
-            body = _format_comment(issue)
-            await post_inline_comment(
-                project_id, mr_iid, filename, line, body, sha
+            comments.append(
+                {
+                    "path": filename,
+                    "line": line,
+                    "side": "RIGHT",
+                    "body": _format_comment(issue),
+                }
             )
 
-    # 2) 전체 요약 노트
     summary = _build_summary(issues)
-    await post_mr_note(project_id, mr_iid, summary)
+
+    payload = {
+        "commit_id": commit_sha,
+        "event": "COMMENT",
+        "body": summary,
+        "comments": comments,
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(url, headers=_headers(), json=payload)
+        # 인라인 코멘트 라인 매핑 실패 시 코멘트 없이 요약만 재시도
+        if resp.status_code >= 400 and comments:
+            payload["comments"] = []
+            await client.post(url, headers=_headers(), json=payload)
