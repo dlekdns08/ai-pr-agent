@@ -50,14 +50,22 @@ async def handle_webhook(request: Request):
     if not installation_id:
         return {"status": "skipped", "reason": "no installation id"}
 
-    token = await get_installation_token(installation_id)
+    try:
+        token = await get_installation_token(installation_id)
+    except Exception as e:
+        logger.error(f"Installation token 발급 실패: {e}")
+        return {"status": "error", "reason": str(e)}
 
-    if event == "pull_request":
-        await _handle_pr(payload, token)
-    elif event == "push":
-        await _handle_push(payload, token)
-    else:
-        return {"status": "skipped", "reason": f"unhandled event: {event}"}
+    try:
+        if event == "pull_request":
+            await _handle_pr(payload, token)
+        elif event == "push":
+            await _handle_push(payload, token)
+        else:
+            return {"status": "skipped", "reason": f"unhandled event: {event}"}
+    except Exception as e:
+        logger.error(f"리뷰 처리 중 에러: {e}", exc_info=True)
+        return {"status": "error", "reason": str(e)}
 
     return {"status": "ok"}
 

@@ -1,6 +1,10 @@
 """GitHub PR 또는 커밋에 리뷰 결과를 코멘트로 작성한다."""
 
+import logging
+
 import httpx
+
+logger = logging.getLogger(__name__)
 
 GITHUB_API = "https://api.github.com"
 
@@ -90,9 +94,13 @@ async def post_pr_review(
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, headers=_headers(token), json=payload)
-        if resp.status_code >= 400 and comments:
-            payload["comments"] = []
-            await client.post(url, headers=_headers(token), json=payload)
+        if resp.status_code >= 400:
+            logger.error(f"PR 리뷰 실패 ({resp.status_code}): {resp.text}")
+            if comments:
+                payload["comments"] = []
+                resp = await client.post(url, headers=_headers(token), json=payload)
+                if resp.status_code >= 400:
+                    logger.error(f"PR 요약 재시도 실패 ({resp.status_code}): {resp.text}")
 
 
 async def post_commit_comment(
@@ -119,7 +127,10 @@ async def post_commit_comment(
                     url, headers=_headers(token), json=payload
                 )
                 if resp.status_code >= 400:
+                    logger.warning(f"인라인 코멘트 실패 ({filename}:{line}): {resp.status_code}")
                     continue
 
         summary = _build_summary(issues)
-        await client.post(url, headers=_headers(token), json={"body": summary})
+        resp = await client.post(url, headers=_headers(token), json={"body": summary})
+        if resp.status_code >= 400:
+            logger.error(f"커밋 요약 코멘트 실패 ({resp.status_code}): {resp.text}")

@@ -2,9 +2,12 @@
 
 import asyncio
 import json
+import logging
 import re
 
 from anthropic import AsyncAnthropic
+
+logger = logging.getLogger(__name__)
 
 client = AsyncAnthropic()
 
@@ -89,6 +92,7 @@ async def review_file(filename: str, patch: str, language: str) -> list[dict]:
     all_issues = []
     for result in results:
         if isinstance(result, Exception):
+            logger.error(f"검사기 실패 ({filename}): {result}")
             continue
         all_issues.extend(result)
 
@@ -126,6 +130,7 @@ async def review_all_files(files: list[dict]) -> list[dict]:
     all_issues = []
     for result in results:
         if isinstance(result, Exception):
+            logger.error(f"파일 리뷰 실패: {result}")
             continue
         all_issues.extend(result)
 
