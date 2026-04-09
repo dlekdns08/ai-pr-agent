@@ -1,0 +1,13 @@
+services:
+  ai-review:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./github-app.pem:/app/github-app.pem:ro
+    environment:
+      - GITHUB_APP_ID=${GITHUB_APP_ID}
+      - GITHUB_APP_PRIVATE_KEY_PATH=/app/github-app.pem
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    restart: unless-stopped

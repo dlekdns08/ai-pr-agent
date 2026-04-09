@@ -1,68 +1,121 @@
-"""AI PR Review Agent - GitHub Actions에서 실행되는 코드 리뷰 에이전트."""
+"""AI PR Review Agent — GitHub App Webhook 서버.
 
-import asyncio
-import json
+모든 레포의 PR/push 이벤트를 수신하여 AI 코드 리뷰를 수행한다.
+"""
+
+import hashlib
+import hmac
+import logging
 import os
-import sys
 
-from diff_collector import get_pr_files
+from fastapi import FastAPI, Request, HTTPException
+
+from diff_collector import get_pr_files, get_commit_files
 from review_agent import review_all_files
-from commenter import post_review
+from commenter import post_pr_review, post_commit_comment
+from github_app import get_installation_token
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="AI PR Review Agent")
+
+WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 
 
-async def main() -> None:
-    # GitHub Actions 환경변수에서 정보 읽기
-    github_event_path = os.environ.get("GITHUB_EVENT_PATH", "")
-    github_token = os.environ.get("GITHUB_TOKEN", "")
+def _verify_signature(body: bytes, signature: str) -> bool:
+    """GitHub webhook 서명을 검증한다."""
+    if not WEBHOOK_SECRET:
+        return True  # 개발 환경용
+    expected = "sha256=" + hmac.new(
+        WEBHOOK_SECRET.encode(), body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
 
-    if not github_event_path:
-        print("ERROR: GITHUB_EVENT_PATH가 설정되지 않았습니다.")
-        print("이 스크립트는 GitHub Actions에서 실행해야 합니다.")
-        sys.exit(1)
 
-    if not github_token:
-        print("ERROR: GITHUB_TOKEN이 설정되지 않았습니다.")
-        sys.exit(1)
+@app.post("/webhook")
+async def handle_webhook(request: Request):
+    body = await request.body()
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("ERROR: ANTHROPIC_API_KEY가 설정되지 않았습니다.")
-        sys.exit(1)
+    # 서명 검증
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not _verify_signature(body, signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
-    # 이벤트 페이로드에서 PR 정보 추출
-    with open(github_event_path) as f:
-        event = json.load(f)
+    event = request.headers.get("X-GitHub-Event", "")
+    payload = await request.json()
 
-    pr = event.get("pull_request", {})
-    pr_number = str(pr.get("number", ""))
-    commit_sha = pr.get("head", {}).get("sha", "")
-    repo_full = os.environ.get("GITHUB_REPOSITORY", "")  # owner/repo
+    # Installation token 발급
+    installation_id = payload.get("installation", {}).get("id")
+    if not installation_id:
+        return {"status": "skipped", "reason": "no installation id"}
 
-    if not pr_number or not repo_full:
-        print("ERROR: PR 정보를 읽을 수 없습니다.")
-        sys.exit(1)
+    token = await get_installation_token(installation_id)
 
-    owner, repo = repo_full.split("/", 1)
-    print(f"레포: {owner}/{repo}, PR: #{pr_number}")
+    if event == "pull_request":
+        await _handle_pr(payload, token)
+    elif event == "push":
+        await _handle_push(payload, token)
+    else:
+        return {"status": "skipped", "reason": f"unhandled event: {event}"}
 
-    # 1) Diff 수집
-    print("변경 파일 수집 중...")
-    files = await get_pr_files(owner, repo, pr_number)
-    print(f"  {len(files)}개 파일 발견")
+    return {"status": "ok"}
 
-    if not files:
-        print("변경된 코드 파일이 없습니다. 리뷰를 건너뜁니다.")
+
+async def _handle_pr(payload: dict, token: str) -> None:
+    """PR 이벤트를 처리한다."""
+    action = payload.get("action", "")
+    if action not in ("opened", "synchronize"):
         return
 
-    # 2) 리뷰 실행
-    print("AI 리뷰 실행 중...")
+    pr = payload["pull_request"]
+    repo = payload["repository"]
+    owner = repo["owner"]["login"]
+    repo_name = repo["name"]
+    pr_number = pr["number"]
+    commit_sha = pr["head"]["sha"]
+
+    logger.info(f"PR 리뷰: {owner}/{repo_name}#{pr_number}")
+
+    files = await get_pr_files(owner, repo_name, pr_number, token)
+    logger.info(f"  {len(files)}개 파일 발견")
+
+    if not files:
+        return
+
     issues = await review_all_files(files)
-    print(f"  {len(issues)}건의 이슈 발견")
+    logger.info(f"  {len(issues)}건의 이슈 발견")
 
-    # 3) PR에 코멘트 작성
-    print("PR에 리뷰 결과 게시 중...")
-    await post_review(owner, repo, pr_number, commit_sha, issues)
-    print("완료!")
+    await post_pr_review(owner, repo_name, pr_number, commit_sha, issues, token)
+    logger.info("  PR 리뷰 게시 완료")
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def _handle_push(payload: dict, token: str) -> None:
+    """push 이벤트를 처리한다."""
+    repo = payload["repository"]
+    owner = repo["owner"]["login"]
+    repo_name = repo["name"]
+    commits = payload.get("commits", [])
+
+    for commit in commits:
+        sha = commit["id"]
+        message = commit["message"].split("\n")[0]
+        logger.info(f"커밋 리뷰: {owner}/{repo_name}@{sha[:7]} - {message}")
+
+        files = await get_commit_files(owner, repo_name, sha, token)
+        logger.info(f"  {len(files)}개 파일 발견")
+
+        if not files:
+            continue
+
+        issues = await review_all_files(files)
+        logger.info(f"  {len(issues)}건의 이슈 발견")
+
+        if issues:
+            await post_commit_comment(owner, repo_name, sha, issues, token)
+            logger.info("  커밋 코멘트 게시 완료")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}

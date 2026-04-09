@@ -1,11 +1,8 @@
-"""GitHub PR에 리뷰 결과를 코멘트로 작성한다."""
-
-import os
+"""GitHub PR 또는 커밋에 리뷰 결과를 코멘트로 작성한다."""
 
 import httpx
 
 GITHUB_API = "https://api.github.com"
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 SEVERITY_EMOJI = {
     "critical": "\u2757",  # ❗
@@ -15,9 +12,9 @@ SEVERITY_EMOJI = {
 }
 
 
-def _headers() -> dict:
+def _headers(token: str) -> dict:
     return {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
     }
 
@@ -58,8 +55,13 @@ def _build_summary(issues: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def post_review(
-    owner: str, repo: str, pr_number: str, commit_sha: str, issues: list[dict]
+async def post_pr_review(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    commit_sha: str,
+    issues: list[dict],
+    token: str,
 ) -> None:
     """PR에 Review API로 인라인 코멘트 + 요약을 한 번에 제출한다."""
     url = f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
@@ -79,7 +81,6 @@ async def post_review(
             )
 
     summary = _build_summary(issues)
-
     payload = {
         "commit_id": commit_sha,
         "event": "COMMENT",
@@ -88,8 +89,37 @@ async def post_review(
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, headers=_headers(), json=payload)
-        # 인라인 코멘트 라인 매핑 실패 시 코멘트 없이 요약만 재시도
+        resp = await client.post(url, headers=_headers(token), json=payload)
         if resp.status_code >= 400 and comments:
             payload["comments"] = []
-            await client.post(url, headers=_headers(), json=payload)
+            await client.post(url, headers=_headers(token), json=payload)
+
+
+async def post_commit_comment(
+    owner: str,
+    repo: str,
+    commit_sha: str,
+    issues: list[dict],
+    token: str,
+) -> None:
+    """커밋에 인라인 코멘트 + 요약을 작성한다."""
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/commits/{commit_sha}/comments"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for issue in issues:
+            line = issue.get("line")
+            filename = issue.get("filename")
+            if line and filename:
+                payload = {
+                    "body": _format_comment(issue),
+                    "path": filename,
+                    "line": line,
+                }
+                resp = await client.post(
+                    url, headers=_headers(token), json=payload
+                )
+                if resp.status_code >= 400:
+                    continue
+
+        summary = _build_summary(issues)
+        await client.post(url, headers=_headers(token), json={"body": summary})
